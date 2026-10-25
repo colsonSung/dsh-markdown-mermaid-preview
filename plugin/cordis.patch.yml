@@ -1,0 +1,3 @@
+- insert:
+    - id: markdown-mermaid-preview
+      name: 'dsh-markdown-mermaid-preview'
