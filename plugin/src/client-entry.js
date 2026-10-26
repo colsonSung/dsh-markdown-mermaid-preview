@@ -1,5 +1,6 @@
 import { Fragment, createElement as h, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { isAbsolutePath, joinPath, pathBasename, pathDirname, pathParts, relativeToRoot, toPosixPath } from '../paths.js';
 
 // Optional host primitive; fall back to plain text when the module table lacks it.
 let MarkdownText = null;
@@ -10,7 +11,7 @@ try {
 }
 
 const NS = 'markdownMermaidPreview';
-const BODY_ID = 'dsh-markdown-mermaid-preview/markdown';
+const BODY_ID = '@local/markdown-mermaid-preview/markdown';
 
 const zh = {
   'viewer.label': 'Markdown (Mermaid)',
@@ -224,10 +225,6 @@ function splitFrontmatter(text) {
   return { source: match[1] ?? '', body: text.slice(match[0].length) };
 }
 
-function isAbsolutePath(path) {
-  return path.startsWith('/') || /^[a-z]:[/\\]/iu.test(path);
-}
-
 function markdownImageUrl(base, documentPath, destination) {
   const suffix = destination.search(/[?#]/u);
   let path;
@@ -240,7 +237,8 @@ function markdownImageUrl(base, documentPath, destination) {
   if (!/^[a-z]:[/\\]/iu.test(path) && /^[a-z][a-z\d+.-]*:/iu.test(path)) return undefined;
   if (!isAbsolutePath(path)) {
     if (documentPath === undefined) return undefined;
-    path = documentPath.slice(0, documentPath.lastIndexOf('/') + 1) + path;
+    // Resolve against the document's own directory, in the document's separator.
+    path = joinPath(pathDirname(documentPath), path);
   }
   return new URL(`api/file?path=${encodeURIComponent(path)}`, base).href;
 }
@@ -883,7 +881,7 @@ function annotateIcon(size = 15) {
 }
 
 /* Take over document tab chips so file-type icons stay distinguishable. */
-const FILES_TYPE_ID = 'dsh-markdown-mermaid-preview/files';
+const FILES_TYPE_ID = '@local/markdown-mermaid-preview/files';
 const DOCUMENT_TYPE_ID = '@deepseek-ai/dsh-client-ui-sidebar-documentpreview';
 
 function DocumentTitleChip({ useTabInfo }) {
@@ -978,12 +976,12 @@ function FilesTreeBody(props) {
     };
   }, [query, sessionId]);
 
-  const rootName = root === undefined ? '' : (root.split('/').filter(Boolean).pop() ?? root);
+  const rootName = root === undefined ? '' : pathBasename(root);
   const createInRoot = async (kind) => {
     if (root === undefined) return;
     const name = await askText(t('tree.namePrompt'));
     if (name === null) return;
-    await fsOp(kind === 'file' ? 'create' : 'mkdir', `${root}/${name}`);
+    await fsOp(kind === 'file' ? 'create' : 'mkdir', joinPath(root, name));
     refreshDir(root);
   };
 
@@ -1002,11 +1000,11 @@ function FilesTreeBody(props) {
   const expandChainTo = (targetPath) => {
     if (root === undefined) return;
     const dir = targetPath === root ? root : targetPath;
-    const rel = dir.startsWith(`${root}/`) ? dir.slice(root.length + 1) : '';
+    const relative = relativeToRoot(dir, root) ?? '';
     const chain = [];
     let acc = root;
-    for (const segment of rel.split('/').filter(Boolean)) {
-      acc = `${acc}/${segment}`;
+    for (const segment of relative.split('/').filter(Boolean)) {
+      acc = joinPath(acc, segment);
       chain.push(acc);
     }
     setExpanded((prev) => {
@@ -1060,14 +1058,14 @@ function FilesTreeBody(props) {
   useEffect(() => {
     if (root === undefined) return;
     if (levels[root] === undefined) loadLevel(root);
-    if (reveal === null || !reveal.startsWith(`${root}/`)) return;
+    if (reveal === null || relativeToRoot(reveal, root) === undefined) return;
     const dir = pathDirname(reveal);
-    const rel = dir === root ? '' : dir.slice(root.length + 1);
+    const rel = dir === root ? '' : (relativeToRoot(dir, root) ?? '');
     let acc = root;
     const chain = [];
     if (rel !== '') {
-      for (const segment of rel.split('/')) {
-        acc = `${acc}/${segment}`;
+      for (const segment of rel.split('/').filter(Boolean)) {
+        acc = joinPath(acc, segment);
         chain.push(acc);
       }
     }
@@ -1140,40 +1138,39 @@ function FilesTreeBody(props) {
     if (action === 'newFile' || action === 'newFolder') {
       const name = await askText(t('tree.namePrompt'));
       if (name === null) return;
-      await fsOp(action === 'newFile' ? 'create' : 'mkdir', `${dirPath}/${name}`);
+      await fsOp(action === 'newFile' ? 'create' : 'mkdir', joinPath(dirPath, name));
       refreshDir(dirPath);
     } else if (action === 'reveal') {
       try {
         await ctx.remote.session.openWorkspacePath({ path: target.path, action: 'reveal' });
       } catch {}
     } else if (action === 'addToChat') {
-      addToChat(inputActions, root !== undefined && target.path.startsWith(`${root}/`) ? target.path.slice(root.length + 1) : target.path, t, { isDir: target.isDir });
+      addToChat(inputActions, relativeToRoot(target.path, root) ?? target.path, t, { isDir: target.isDir });
     } else if (action === 'cut' || action === 'copy') {
       treeClipboard.op = action;
       treeClipboard.path = target.path;
     } else if (action === 'paste') {
       if (treeClipboard.path === null) return;
-      const name = treeClipboard.path.slice(treeClipboard.path.lastIndexOf('/') + 1);
-      const destination = `${dirPath}/${name}`;
+      const name = pathBasename(treeClipboard.path);
+      const destination = joinPath(dirPath, name);
       await fsOp(treeClipboard.op === 'cut' ? 'move' : 'copy', treeClipboard.path, { target: destination });
       if (treeClipboard.op === 'cut') treeClipboard.path = null;
       refreshDir(dirPath);
     } else if (action === 'copyPath') {
       try { await navigator.clipboard.writeText(target.path); } catch {}
     } else if (action === 'copyRelativePath') {
-      const base = root === undefined ? '' : root.replace(/[/\\]+$/, '');
-      const relative = base !== '' && target.path.startsWith(`${base}/`) ? target.path.slice(base.length + 1) : target.path;
+      const relative = relativeToRoot(target.path, root) ?? target.path;
       try { await navigator.clipboard.writeText(relative); } catch {}
     } else if (action === 'rename') {
-      const current = target.path.slice(target.path.lastIndexOf('/') + 1);
+      const current = pathBasename(target.path);
       const name = await askText(t('tree.renamePrompt'), current);
       if (name === null || name === current) return;
-      await fsOp('rename', target.path, { target: `${dirPath}/${name}` });
+      await fsOp('rename', target.path, { target: joinPath(dirPath, name) });
       refreshDir(dirPath);
     } else if (action === 'pin' || action === 'unpin') {
       togglePinned(target.path, target.isDir);
     } else if (action === 'delete') {
-      const name = target.path.slice(target.path.lastIndexOf('/') + 1);
+      const name = pathBasename(target.path);
       if (!(await askConfirm(t('tree.deleteConfirm', { name })))) return;
       await fsOp('delete', target.path);
       refreshDir(dirPath);
@@ -1210,7 +1207,7 @@ function FilesTreeBody(props) {
     }
     const rows = [];
     for (const entry of level.entries) {
-      const child = childPath(path, entry.name);
+      const child = joinPath(path, entry.name);
       const isDir = entry.type === 'directory';
       const isCurrent = child === reveal;
       rows.push(
@@ -1253,7 +1250,7 @@ function FilesTreeBody(props) {
                   'aria-label': t('chat.addTitle'),
                   onClick: (event) => {
                     event.stopPropagation();
-                    addToChat(inputActions, child.startsWith(`${root}/`) ? child.slice(root.length + 1) : child, t);
+                    addToChat(inputActions, relativeToRoot(child, root) ?? child, t);
                   },
                 },
                 chatBubbleIcon(13),
@@ -1357,7 +1354,7 @@ function FilesTreeBody(props) {
                         h('div', { className: 'mmd-tree-section-title', key: 'title' }, t('tree.pinned')),
                         pinned.map((item) => {
                           const path = item.path;
-                          const name = path.slice(path.lastIndexOf('/') + 1) || path;
+                          const name = pathBasename(path) || path;
                           return h('div', { className: 'mmd-tree-pinned-row', key: path }, [
                             h('button', {
                               type: 'button', key: 'open',
@@ -1383,9 +1380,10 @@ function FilesTreeBody(props) {
                   ? [h('div', { className: 'mmd-locate-note', key: 'noresults' }, t('tree.noResults'))]
                   : results.map((candidate) => {
                       const relative = String(candidate.path ?? '');
-                      const absolute = relative.startsWith(root) ? relative : `${root}/${relative}`;
-                      const name = relative.slice(relative.lastIndexOf('/') + 1) || relative;
-                      const parent = relative.slice(0, relative.lastIndexOf('/'));
+                      const absolute = isAbsolutePath(relative) ? relative : joinPath(root, relative);
+                      const parts = pathParts(relative);
+                      const name = parts.name || relative;
+                      const parent = parts.directory.replace(/[/\\]+$/, '');
                       const isDir = candidate.kind === 'directory';
                       return h('button', {
                         type: 'button', key: absolute,
@@ -1508,17 +1506,6 @@ function sessionFileAddress(sessionId, path) {
   const normalized = path.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '');
   const encoded = normalized.split('/').map(encodeAddressSegment).join('/');
   return `dsh-resource://file/session/${encodeAddressSegment(sessionId)}/${encoded}`;
-}
-
-function pathDirname(path) {
-  const trimmed = path.replace(/[/\\]+$/, '');
-  const index = trimmed.lastIndexOf('/');
-  if (index < 0) return trimmed;
-  return index === 0 ? '/' : trimmed.slice(0, index);
-}
-
-function childPath(parent, name) {
-  return `${parent.replace(/[/\\]+$/, '')}/${name}`;
 }
 
 function orderEntries(entries) {
@@ -1671,8 +1658,8 @@ async function askConfirm(message) {
 function addToChat(inputActions, path, t, options = {}) {
   if (inputActions === undefined || inputActions === null) return;
   const isDir = options.isDir === true;
-  const clean = String(path).replace(/\/+$/, '');
-  const name = clean.slice(clean.lastIndexOf('/') + 1) || clean;
+  const clean = toPosixPath(path).replace(/\/+$/, '');
+  const name = pathBasename(clean) || clean;
   const quoted = /\s/.test(clean);
   const mention = isDir
     ? quoted ? `@"${clean}` : `@${clean}/`
@@ -1776,7 +1763,7 @@ function RevealAction(props) {
 /* HTML annotation renderer: element picking inside a sandboxed frame. */
 /* ------------------------------------------------------------------ */
 
-const HTML_ANNOTATE_ID = 'dsh-markdown-mermaid-preview/html-annotate';
+const HTML_ANNOTATE_ID = '@local/markdown-mermaid-preview/html-annotate';
 
 const PICKER_STYLE =
   '.mmd-pick-hover{position:fixed;pointer-events:none;border:2px solid #6c5ce7;border-radius:3px;z-index:2147483646;display:none;background:rgba(108,92,231,.06)}' +
@@ -1947,8 +1934,7 @@ function HtmlAnnotateBody(props) {
   const shownPath = useMemo(() => {
     if (absolutePath === undefined) return '';
     if (typeof cwd !== 'string' || cwd.length <= 1) return absolutePath;
-    const base = cwd.replace(/[/\\]+$/, '');
-    return absolutePath.startsWith(`${base}/`) ? absolutePath.slice(base.length + 1) : absolutePath;
+    return relativeToRoot(absolutePath, cwd) ?? absolutePath;
   }, [cwd, absolutePath]);
 
   useEffect(() => {
@@ -2706,8 +2692,7 @@ function MarkdownMermaidBody({ ctx, content, resourceAddress, useResource, input
   const cwd = typeof useSessions === 'function' ? useSessions((state) => state.byId?.[sessionId]?.cwd) : undefined;
   const shownPath = useMemo(() => {
     if (typeof cwd !== 'string' || cwd.length <= 1 || absolutePath === undefined) return absolutePath ?? '';
-    const base = cwd.replace(/[/\\]+$/, '');
-    return absolutePath.startsWith(`${base}/`) ? absolutePath.slice(base.length + 1) : absolutePath;
+    return relativeToRoot(absolutePath, cwd) ?? absolutePath;
   }, [cwd, absolutePath]);
   const pathImages = useMemo(
     () => ({ resolve: (value) => markdownImageUrl(document.baseURI, absolutePath, value) }),
@@ -2992,7 +2977,7 @@ function MarkdownMermaidBody({ ctx, content, resourceAddress, useResource, input
 /* Image annotation renderer: drag-select regions on a raster image.   */
 /* ------------------------------------------------------------------ */
 
-const IMAGE_ANNOTATE_ID = 'dsh-markdown-mermaid-preview/image-annotate';
+const IMAGE_ANNOTATE_ID = '@local/markdown-mermaid-preview/image-annotate';
 
 function imageAnnotateMessage(t, path, regions) {
   const list = regions.map((item, index) => {
@@ -3023,8 +3008,7 @@ function ImageAnnotateBody(props) {
   const shownPath = useMemo(() => {
     if (absolutePath === undefined) return '';
     if (typeof cwd !== 'string' || cwd.length <= 1) return absolutePath;
-    const base = cwd.replace(/[/\\]+$/, '');
-    return absolutePath.startsWith(`${base}/`) ? absolutePath.slice(base.length + 1) : absolutePath;
+    return relativeToRoot(absolutePath, cwd) ?? absolutePath;
   }, [cwd, absolutePath]);
 
   useEffect(() => {

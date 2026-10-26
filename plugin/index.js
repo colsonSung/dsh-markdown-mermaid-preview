@@ -3,6 +3,7 @@
  * Markdown editor and the file-tree context menu, plus session-title commands.
  */
 import { copyFile, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { isAbsolutePath, pathSegments } from './paths.js';
 export const inject = ['commands', 'fs', 'sessionTitle'];
 
 export function apply(ctx) {
@@ -20,7 +21,7 @@ export function apply(ctx) {
             const content = payload?.content;
             if (typeof target !== 'string' || target.length === 0) return { kind: 'error', text: 'mmd-save: missing path' };
             if (typeof content !== 'string') return { kind: 'error', text: 'mmd-save: missing content' };
-            if (!target.startsWith('/')) return { kind: 'error', text: 'mmd-save: absolute path required' };
+            if (!isAbsolutePath(target)) return { kind: 'error', text: 'mmd-save: absolute path required' };
             if (target.includes('..')) return { kind: 'error', text: 'mmd-save: path traversal refused' };
             if (content.length > 4 * 1024 * 1024) return { kind: 'error', text: 'mmd-save: content too large' };
             const info = await ctx.fs.lstat(target);
@@ -87,9 +88,9 @@ export function apply(ctx) {
         handler: async ({ rawInput }) => {
           const guard = (value) => {
             if (typeof value !== 'string' || value.length === 0) throw new Error('path required');
-            if (!value.startsWith('/')) throw new Error('absolute path required');
+            if (!isAbsolutePath(value)) throw new Error('absolute path required');
             if (value.includes('..')) throw new Error('path traversal refused');
-            if (value.split('/').filter(Boolean).length < 2) throw new Error('path too shallow');
+            if (pathSegments(value).length < 2) throw new Error('path too shallow');
             return value;
           };
           try {

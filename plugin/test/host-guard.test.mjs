@@ -1,0 +1,96 @@
+/**
+ * Guard tests for the host half's absolute-path handling.
+ *
+ * The `mmd-fs` command validates its path before it dispatches on the
+ * operation, so an unknown operation exercises the guard without touching the
+ * filesystem. `mmd-save` writes through `ctx.fs`, which the double below
+ * stubs out.
+ *
+ * Run with `node --test test/`.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { apply } from '../index.js';
+
+/** Mount the host half against a double and return the registered commands. */
+const mount = () => {
+  const commands = new Map();
+  const ctx = {
+    effect: (fn) => {
+      const disposer = fn();
+      return typeof disposer === 'function' ? disposer : () => {};
+    },
+    commands: {
+      register: (descriptor) => {
+        commands.set(descriptor.name, descriptor);
+        return () => {};
+      },
+    },
+    fs: {
+      lstat: async () => ({ type: 'file' }),
+      resolve: (path) => path,
+      writeText: async () => {},
+    },
+    sessionTitle: {
+      refresh: async () => {},
+      rename: async () => {},
+    },
+  };
+  apply(ctx);
+  return commands;
+};
+
+const run = async (name, payload) => {
+  const commands = mount();
+  const descriptor = commands.get(name);
+  assert.ok(descriptor, `${name} is registered`);
+  return descriptor.handler({ rawInput: JSON.stringify(payload) });
+};
+
+/** An operation the command does not know, so the guard is the only thing that can fail. */
+const NOOP = 'noop';
+
+test('mmd-save accepts the path spellings the Harness reports', async () => {
+  for (const path of [
+    '/home/user/note.md',
+    'D:\\workspace\\note.md',
+    'D:\\workspace\\docs\\note.md',
+    '\\\\server\\share\\note.md',
+  ]) {
+    const result = await run('mmd-save', { path, content: '# hi' });
+    assert.equal(result.kind, 'success', `${path} should be accepted`);
+  }
+});
+
+test('mmd-save refuses a relative path and a traversal', async () => {
+  const relative = await run('mmd-save', { path: 'note.md', content: '# hi' });
+  assert.equal(relative.kind, 'error');
+  assert.match(relative.text, /absolute path required/);
+
+  const traversal = await run('mmd-save', { path: 'D:\\workspace\\a\\..\\b.md', content: '# hi' });
+  assert.equal(traversal.kind, 'error');
+  assert.match(traversal.text, /path traversal refused/);
+});
+
+test('mmd-fs accepts every absolute spelling', async () => {
+  for (const path of [
+    '/home/user/dir',
+    'D:\\workspace\\dir',
+    'D:\\workspace\\docs\\dir',
+    '\\\\server\\share\\dir',
+  ]) {
+    const result = await run('mmd-fs', { op: NOOP, path });
+    assert.match(result.text, /unknown op/, `${path} should reach the operation dispatch`);
+  }
+});
+
+test('mmd-fs refuses a relative path, a traversal and a drive root', async () => {
+  const relative = await run('mmd-fs', { op: NOOP, path: 'dir' });
+  assert.match(relative.text, /absolute path required/);
+
+  const traversal = await run('mmd-fs', { op: NOOP, path: 'D:\\workspace\\a\\..\\b' });
+  assert.match(traversal.text, /path traversal refused/);
+
+  const driveRoot = await run('mmd-fs', { op: NOOP, path: 'D:\\' });
+  assert.match(driveRoot.text, /path too shallow/);
+});
